@@ -1,6 +1,4 @@
----
-
-# OpenGL Dual Triangle Rendering (GLFW + GLAD)
+# OpenGL Star Rendering by Dual Triangle (GLFW + GLAD)
 
 This project demonstrates **Modern OpenGL (3.3 Core Profile)** using **GLFW** and **GLAD** to render:
 
