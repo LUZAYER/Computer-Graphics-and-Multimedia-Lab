@@ -1,130 +1,197 @@
-#include "glad.h"
+#include "glad.c"      // inline OpenGL loader — no separate glad.c needed
 #include "glfw3.h"
+#include <stdio.h>
 
-#include <iostream>
-#include <cstdlib>
-#include <ctime>
+// ── Shaders ───────────────────────────────────────────────────────────────────
+const char* VS =
+    "#version 330 core\n"
+    "layout(location=0) in vec2 pos;\n"
+    "uniform vec2 offset;\n"
+    "void main() { gl_Position = vec4(pos + offset, 0.0, 1.0); }\n";
 
-#include "game.h"
+const char* FS =
+    "#version 330 core\n"
+    "out vec4 fragColor;\n"
+    "uniform vec4 color;\n"
+    "void main() { fragColor = color; }\n";
 
-void framebuffer_size_callback(GLFWwindow* window, int width, int height);
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods);
+// ── Constants ─────────────────────────────────────────────────────────────────
+#define MAX_OBS   4
+#define GROUND_Y -0.65f
+#define PLAYER_X -0.55f
 
-// settings
-const unsigned int SCR_WIDTH = 800;
-const unsigned int SCR_HEIGHT = 600;
+// ── State ─────────────────────────────────────────────────────────────────────
+float posY = 0.0f, velY = 0.0f;
+int   onGround = 1, gameOver = 0, score = 0;
+float speed = 0.55f, spawnTimer = 0.0f, spawnInterval = 1.8f;
 
-Game *gamePtr = nullptr;
+typedef struct { float x; int active, scored; } Obs;
+Obs obs[MAX_OBS];
 
-int main()
-{
-    // seed random
-    srand((unsigned int)time(NULL));
+void resetGame() {
+    posY = 0.0f; velY = 0.0f; onGround = 1;
+    gameOver = 0; score = 0;
+    speed = 0.55f; spawnTimer = 0.0f; spawnInterval = 1.8f;
+    for (int i = 0; i < MAX_OBS; i++) obs[i].active = 0;
+}
 
-    // glfw: initialize and configure
-    // ------------------------------
+// ── Main ──────────────────────────────────────────────────────────────────────
+int main() {
     glfwInit();
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-#ifdef __APPLE__
-    glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-#endif
+    GLFWwindow* win = glfwCreateWindow(700, 500, "Triangle Jump", NULL, NULL);
+    glfwMakeContextCurrent(win);
+    gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 
-    // glfw window creation
-    // --------------------
-    GLFWwindow* window = glfwCreateWindow(SCR_WIDTH, SCR_HEIGHT,
-                                          "TRIANGULAR JUMP", NULL, NULL);
-    if (window == NULL)
-    {
-        std::cout << "Failed to create GLFW window" << std::endl;
-        glfwTerminate();
-        return -1;
-    }
-    glfwMakeContextCurrent(window);
-    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-    glfwSetKeyCallback(window, key_callback);
+    // Player triangle
+    float triVerts[] = {
+         0.0f,  0.12f,
+        -0.08f, 0.0f,
+         0.08f, 0.0f
+    };
+    unsigned int triVAO, triVBO;
+    glGenVertexArrays(1, &triVAO); glGenBuffers(1, &triVBO);
+    glBindVertexArray(triVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, triVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(triVerts), triVerts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
-    // glad: load all OpenGL function pointers
-    // ---------------------------------------
-    if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress))
-    {
-        std::cout << "Failed to initialize GLAD" << std::endl;
-        return -1;
-    }
+    // Obstacle rectangle (two triangles)
+    float obsVerts[] = {
+        -0.035f, 0.0f,    0.035f, 0.0f,    0.035f, 0.30f,
+        -0.035f, 0.0f,    0.035f, 0.30f,  -0.035f, 0.30f
+    };
+    unsigned int obsVAO, obsVBO;
+    glGenVertexArrays(1, &obsVAO); glGenBuffers(1, &obsVBO);
+    glBindVertexArray(obsVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, obsVBO);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(obsVerts), obsVerts, GL_STATIC_DRAW);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2*sizeof(float), (void*)0);
+    glEnableVertexAttribArray(0);
 
-    // configure OpenGL
-    // ----------------
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    // Compile shaders
+    unsigned int vs = glCreateShader(GL_VERTEX_SHADER);
+    glShaderSource(vs, 1, &VS, NULL); glCompileShader(vs);
+    unsigned int fs = glCreateShader(GL_FRAGMENT_SHADER);
+    glShaderSource(fs, 1, &FS, NULL); glCompileShader(fs);
+    unsigned int prog = glCreateProgram();
+    glAttachShader(prog, vs); glAttachShader(prog, fs);
+    glLinkProgram(prog);
+    glDeleteShader(vs); glDeleteShader(fs);
 
-    // initialize game
-    // ---------------
-    Game game((float)SCR_WIDTH, (float)SCR_HEIGHT);
-    gamePtr = &game;
-    game.init();
+    int uOffset = glGetUniformLocation(prog, "offset");
+    int uColor  = glGetUniformLocation(prog, "color");
 
-    // timing
-    float deltaTime = 0.0f;
-    float lastFrame = 0.0f;
+    resetGame();
+    double prevTime = glfwGetTime();
+    int spaceWasDown = 0;
+    char title[64];
 
-    // render loop
-    // -----------
-    while (!glfwWindowShouldClose(window))
-    {
-        float currentFrame = (float)glfwGetTime();
-        deltaTime = currentFrame - lastFrame;
-        lastFrame = currentFrame;
-        if (deltaTime > 0.05f) deltaTime = 0.05f;
-
-        // input
+    // ── Game loop ─────────────────────────────────────────────────────────────
+    while (!glfwWindowShouldClose(win)) {
         glfwPollEvents();
-        game.processInput(deltaTime);
 
-        // update
-        game.update(deltaTime);
+        if (glfwGetKey(win, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+            glfwSetWindowShouldClose(win, 1);
 
-        // render
-        glClearColor(0.01f, 0.01f, 0.06f, 1.0f);
+        int spaceDown = (glfwGetKey(win, GLFW_KEY_SPACE) == GLFW_PRESS);
+
+        double now = glfwGetTime();
+        float  dt  = (float)(now - prevTime);
+        prevTime   = now;
+
+        if (gameOver) {
+            if (spaceDown && !spaceWasDown) {
+                resetGame();
+                glfwSetWindowTitle(win, "Triangle Jump");
+            }
+        } else {
+            // Jump
+            if (spaceDown && !spaceWasDown && onGround) {
+                velY = 2.5f; onGround = 0;
+            }
+
+            // Physics
+            velY += -4.0f * dt;
+            posY += velY  * dt;
+            if (posY <= 0.0f) { posY = 0.0f; velY = 0.0f; onGround = 1; }
+
+            // Spawn obstacle
+            spawnTimer += dt;
+            if (spawnTimer >= spawnInterval) {
+                spawnTimer = 0.0f;
+                for (int i = 0; i < MAX_OBS; i++) {
+                    if (!obs[i].active) {
+                        obs[i].x = 1.2f; obs[i].active = 1; obs[i].scored = 0;
+                        break;
+                    }
+                }
+            }
+
+            // Move + score + collision
+            for (int i = 0; i < MAX_OBS; i++) {
+                if (!obs[i].active) continue;
+
+                obs[i].x -= speed * dt;
+
+                if (!obs[i].scored && obs[i].x < PLAYER_X - 0.08f) {
+                    obs[i].scored = 1; score++;
+                    if (score % 5 == 0) {
+                        speed += 0.08f;
+                        if (spawnInterval > 1.0f) spawnInterval -= 0.15f;
+                    }
+                    snprintf(title, sizeof(title), "Triangle Jump  |  Score: %d", score);
+                    glfwSetWindowTitle(win, title);
+                }
+
+                if (obs[i].x < -1.3f) { obs[i].active = 0; continue; }
+
+                // AABB collision
+                float px0 = PLAYER_X - 0.06f, px1 = PLAYER_X + 0.06f;
+                float py0 = GROUND_Y + posY,   py1 = py0 + 0.10f;
+                float ox0 = obs[i].x - 0.028f, ox1 = obs[i].x + 0.028f;
+                float oy0 = GROUND_Y,           oy1 = oy0 + 0.30f;
+
+                if (px1 > ox0 && px0 < ox1 && py1 > oy0 && py0 < oy1) {
+                    gameOver = 1;
+                    snprintf(title, sizeof(title),
+                             "GAME OVER  |  Score: %d  |  SPACE to restart", score);
+                    glfwSetWindowTitle(win, title);
+                }
+            }
+        }
+
+        spaceWasDown = spaceDown;
+
+        // ── Render ────────────────────────────────────────────────────────────
+        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
-        game.render(currentFrame);
+        glUseProgram(prog);
 
-        // swap
-        glfwSwapBuffers(window);
+        // Player
+        glUniform2f(uOffset, PLAYER_X, GROUND_Y + posY);
+        glUniform4f(uColor, gameOver ? 0.9f : 1.0f,
+                            gameOver ? 0.25f : 0.85f,
+                            0.2f, 1.0f);
+        glBindVertexArray(triVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+
+        // Obstacles
+        glUniform4f(uColor, 0.3f, 0.85f, 1.0f, 1.0f);
+        glBindVertexArray(obsVAO);
+        for (int i = 0; i < MAX_OBS; i++) {
+            if (!obs[i].active) continue;
+            glUniform2f(uOffset, obs[i].x, GROUND_Y);
+            glDrawArrays(GL_TRIANGLES, 0, 6);
+        }
+
+        glfwSwapBuffers(win);
     }
-
-    gamePtr = nullptr;
 
     glfwTerminate();
     return 0;
-}
-
-// keyboard callback
-// -----------------
-void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods)
-{
-    if (key == GLFW_KEY_X && action == GLFW_PRESS)
-        glfwSetWindowShouldClose(window, true);
-
-    if (key >= 0 && key < 1024)
-    {
-        if (action == GLFW_PRESS)
-        {
-            if (gamePtr) gamePtr->keys[key] = true;
-            if (gamePtr) gamePtr->keysProcessed[key] = false;
-        }
-        else if (action == GLFW_RELEASE)
-        {
-            if (gamePtr) gamePtr->keys[key] = false;
-            if (gamePtr) gamePtr->keysProcessed[key] = false;
-        }
-    }
-}
-
-// framebuffer resize callback
-// ---------------------------
-void framebuffer_size_callback(GLFWwindow* window, int width, int height)
-{
-    glViewport(0, 0, width, height);
 }
